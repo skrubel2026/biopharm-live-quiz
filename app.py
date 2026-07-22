@@ -175,12 +175,86 @@ def parse_questions_text(paragraphs):
     return questions, errors
 
 
-def extract_paragraphs_from_upload(uploaded_file):
+def parse_docx_table(table):
+    """Parses the 'numbered table' quiz format: one column for the question
+    number, two columns holding the stem / option pairs (A+B on one row,
+    C+D on the next), and a final column repeating the correct answer letter
+    on every row belonging to that question."""
+    groups = {}
+    order = []
+    for r in table.rows:
+        cells = [c.text.strip() for c in r.cells]
+        if len(cells) < 3:
+            continue
+        num = cells[0].strip()
+        if not num or not num.replace(".", "").isdigit():
+            continue  # header row or a stray row with no question number
+        if num not in groups:
+            groups[num] = []
+            order.append(num)
+        groups[num].append(cells)
+
+    opt_re = re.compile(r'^([A-D])\s*[.\)]\s*(.*)$', re.IGNORECASE)
+    questions, errors = [], []
+    for num in order:
+        stem = None
+        opts = {}
+        correct = None
+        for cells in groups[num]:
+            last = cells[-1].strip()
+            if last and len(last) <= 2 and last.upper() in "ABCD":
+                correct = last.upper()
+            found_opt = False
+            for cell_text in cells[1:-1]:
+                cell_text = cell_text.strip()
+                if not cell_text:
+                    continue
+                m = opt_re.match(cell_text)
+                if m:
+                    opts[m.group(1).upper()] = m.group(2).strip()
+                    found_opt = True
+            if not found_opt:
+                for cell_text in cells[1:-1]:
+                    if cell_text.strip():
+                        stem = cell_text.strip()
+                        break
+        missing = [L for L in "ABCD" if L not in opts]
+        if not stem:
+            errors.append(f"Question {num}: missing question text.")
+        elif missing:
+            errors.append(f"Question {num} ('{stem[:40]}...'): missing option(s) {', '.join(missing)}.")
+        elif not correct:
+            errors.append(f"Question {num} ('{stem[:40]}...'): no correct-answer letter found.")
+        else:
+            questions.append({
+                "q": stem,
+                "options": [opts["A"], opts["B"], opts["C"], opts["D"]],
+                "correct_index": "ABCD".index(correct),
+                "time": 30,
+            })
+    return questions, errors
+
+
+def extract_questions_from_upload(uploaded_file):
+    """Handles both the numbered-table Word format and the plain-text
+    Q:/A)/Correct: format, plus .txt files. Returns (questions, errors)."""
     if uploaded_file.name.lower().endswith(".docx"):
         doc = Document(io.BytesIO(uploaded_file.read()))
-        return [p.text for p in doc.paragraphs]
+        if doc.tables:
+            # Try every table and keep whichever one yields the most valid questions
+            best_q, best_err = [], ["No recognizable table or question text found in this file."]
+            for table in doc.tables:
+                qs, errs = parse_docx_table(table)
+                if len(qs) > len(best_q):
+                    best_q, best_err = qs, errs
+            if best_q:
+                return best_q, best_err
+        # No usable table — fall back to reading it as plain Q:/A)/Correct: paragraphs
+        paragraphs = [p.text for p in doc.paragraphs]
+        return parse_questions_text(paragraphs)
     else:
-        return uploaded_file.read().decode("utf-8", errors="ignore").split("\n")
+        lines = uploaded_file.read().decode("utf-8", errors="ignore").split("\n")
+        return parse_questions_text(lines)
 
 
 # ============================================================
@@ -235,7 +309,10 @@ def render_host():
             st.write("---")
             st.write("**Upload questions from a Word or text file**")
             st.caption(
-                "Format each question like this, with a blank line between questions:\n\n"
+                "Two formats are supported — use whichever you already have:\n\n"
+                "**1) Numbered table** (question #, stem, options A-D, correct letter column) — "
+                "just export your existing quiz table as .docx.\n\n"
+                "**2) Plain text**, one block per question, blank line between:\n"
                 "Q: Your question text?\n"
                 "A) First option\n"
                 "B) Second option\n"
@@ -246,8 +323,7 @@ def render_host():
             )
             uploaded = st.file_uploader("Upload .docx or .txt", type=["docx", "txt"], key="q_upload")
             if uploaded is not None:
-                paragraphs = extract_paragraphs_from_upload(uploaded)
-                parsed, parse_errors = parse_questions_text(paragraphs)
+                parsed, parse_errors = extract_questions_from_upload(uploaded)
                 if parse_errors:
                     st.warning("Some questions couldn't be read:\n\n" + "\n".join(f"- {e}" for e in parse_errors))
                 if parsed:

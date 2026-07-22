@@ -28,6 +28,8 @@ import time
 import re
 import uuid
 import io
+import csv
+import datetime
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 from docx import Document
@@ -125,6 +127,56 @@ def my_progress(state, pid, up_to_q):
             if a.get("correct"):
                 correct_count += 1
     return correct_count, attempted
+
+
+def detailed_results(state):
+    """One row per student per question — exactly what they selected, whether
+    it was correct, how long they took, and points earned. This is the audit
+    trail: it comes straight from what was recorded live during the quiz,
+    not from anything re-entered afterward."""
+    rows = []
+    for pid, info in state["roster"].items():
+        for qi, q in enumerate(state["questions"]):
+            a = state["answers"].get(qi, {}).get(pid)
+            correct_letter = chr(65 + q["correct_index"])
+            correct_text = q["options"][q["correct_index"]]
+            if a is None:
+                selected = "No answer recorded"
+                was_correct = "No"
+                took = ""
+                pts = 0
+            elif a["choice"] == -1:
+                selected = "No answer (timed out)"
+                was_correct = "No"
+                took = round(a.get("elapsed", 0), 2)
+                pts = a.get("score", 0)
+            else:
+                selected = f"{chr(65+a['choice'])}. {q['options'][a['choice']]}"
+                was_correct = "Yes" if a.get("correct") else "No"
+                took = round(a.get("elapsed", 0), 2)
+                pts = a.get("score", 0)
+            rows.append({
+                "Student Name": info["name"],
+                "Student ID": info["sid"],
+                "Question #": qi + 1,
+                "Question": q["q"],
+                "Selected Answer": selected,
+                "Correct Answer": f"{correct_letter}. {correct_text}",
+                "Was Correct": was_correct,
+                "Time Taken (s)": took,
+                "Points Earned": pts,
+            })
+    return rows
+
+
+def rows_to_csv_bytes(rows):
+    if not rows:
+        return b""
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=list(rows[0].keys()))
+    writer.writeheader()
+    writer.writerows(rows)
+    return buf.getvalue().encode("utf-8")
 
 
 def reset_quiz(state):
@@ -476,8 +528,57 @@ def render_host():
     elif state["status"] == "finished":
         st.title("🏁 Quiz complete")
         st.write(f"{len(state['questions'])} questions · {len(state['roster'])} students")
-        for i, row in enumerate(leaderboard(state)):
+        board = leaderboard(state)
+        for i, row in enumerate(board):
             st.markdown(f'<div class="board-row"><span class="rank">#{i+1}</span><span>{row["name"]} ({row["sid"]})</span><span class="score">{row["score"]}</span></div>', unsafe_allow_html=True)
+
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M")
+
+        st.write("---")
+        st.subheader("📥 Save results")
+        st.caption("This records exactly what each student selected and when, as it happened live — useful if a student disputes their score.")
+
+        summary_rows = [{"Rank": i + 1, "Student Name": r["name"], "Student ID": r["sid"], "Total Score": r["score"]} for i, r in enumerate(board)]
+        detail_rows = detailed_results(state)
+
+        col1, col2 = st.columns(2)
+        col1.download_button(
+            "Download leaderboard (CSV)",
+            data=rows_to_csv_bytes(summary_rows),
+            file_name=f"quiz_leaderboard_{timestamp}.csv",
+            mime="text/csv",
+        )
+        col2.download_button(
+            "Download full answer log (CSV)",
+            data=rows_to_csv_bytes(detail_rows),
+            file_name=f"quiz_answers_{timestamp}.csv",
+            mime="text/csv",
+        )
+
+        with st.expander("🔍 Review individual student answers"):
+            student_options = {f"{info['name']} ({info['sid']})": pid for pid, info in state["roster"].items()}
+            if student_options:
+                pick = st.selectbox("Choose a student", list(student_options.keys()))
+                chosen_pid = student_options[pick]
+                for qi, q in enumerate(state["questions"]):
+                    a = state["answers"].get(qi, {}).get(chosen_pid)
+                    correct_letter = chr(65 + q["correct_index"])
+                    if a is None:
+                        sel = "No answer recorded"
+                    elif a["choice"] == -1:
+                        sel = "No answer (timed out)"
+                    else:
+                        sel = f"{chr(65+a['choice'])}. {q['options'][a['choice']]}"
+                    ok = a.get("correct") if a else False
+                    pts = a.get("score", 0) if a else 0
+                    took = f"{a.get('elapsed', 0):.1f}s" if a else "—"
+                    marker = "✅" if ok else "❌"
+                    st.write(f"{marker} **Q{qi+1}.** {q['q']}")
+                    st.caption(f"Selected: {sel} · Correct answer: {correct_letter}. {q['options'][q['correct_index']]} · Time: {took} · Points: {pts}")
+            else:
+                st.caption("No students joined this session.")
+
+        st.write("---")
         if st.button("Start a new session"):
             reset_quiz(state)
             st.rerun()

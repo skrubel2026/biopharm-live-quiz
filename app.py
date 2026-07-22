@@ -71,26 +71,60 @@ def get_state():
         "question_started_at": 0.0,
         "reveal_started_at": 0.0,
         "questions": [dict(q) for q in QUESTIONS],  # editable copy — host can add/remove from the UI
-        "roster": {},                # pid -> name
+        "roster": {},                # pid -> {"name": str, "sid": str}
         "answers": {},                # q_index -> {pid: {"choice", "correct", "elapsed", "score"}}
     }
 
 
-def compute_score(correct, elapsed, time_limit):
-    if not correct:
-        return 0
-    raw = 100 - (elapsed / time_limit) * 90
-    return max(10, round(raw))
+def rank_and_score_round(state, q_idx, time_limit):
+    """Called once, right when a question's timer ends. Ranks every correct
+    answer for that question by how fast it was (ties within 0.1s count as
+    the same rank and get the same score), then writes a 'score' into each
+    answer record. Fastest correct = 100, each following distinct rank loses
+    10, floor of 10 points for any correct answer. Wrong/no answer = 0."""
+    qanswers = state["answers"].get(q_idx, {})
+    correct_entries = sorted(
+        [(pid, a["elapsed"]) for pid, a in qanswers.items() if a.get("correct")],
+        key=lambda x: x[1],
+    )
+    rank = 0
+    last_time = None
+    for pid, elapsed in correct_entries:
+        if last_time is None or round(elapsed, 1) > round(last_time, 1):
+            rank += 1
+            last_time = elapsed
+        score = max(10, 100 - (rank - 1) * 10)
+        qanswers[pid]["score"] = score
+    for pid, a in qanswers.items():
+        if not a.get("correct"):
+            a["score"] = 0
 
 
 def leaderboard(state):
     totals = {pid: 0 for pid in state["roster"]}
     for qdict in state["answers"].values():
         for pid, a in qdict.items():
-            totals[pid] = totals.get(pid, 0) + a["score"]
-    rows = [{"name": state["roster"].get(pid, "?"), "score": s} for pid, s in totals.items()]
+            totals[pid] = totals.get(pid, 0) + a.get("score", 0)
+    rows = []
+    for pid, s in totals.items():
+        info = state["roster"].get(pid, {"name": "?", "sid": "?"})
+        rows.append({"pid": pid, "name": info["name"], "sid": info["sid"], "score": s})
     rows.sort(key=lambda r: r["score"], reverse=True)
     return rows
+
+
+def my_progress(state, pid, up_to_q):
+    """How many questions this student has gotten correct so far, out of
+    how many they've attempted (only counts questions up to and including
+    the current one, so it never reveals future questions)."""
+    correct_count, attempted = 0, 0
+    for qi in range(0, up_to_q + 1):
+        a = state["answers"].get(qi, {}).get(pid)
+        if a:
+            attempted += 1
+            if a.get("correct"):
+                correct_count += 1
+    return correct_count, attempted
 
 
 def reset_quiz(state):
@@ -289,10 +323,10 @@ def render_host():
         st.title("Waiting room")
         st.write("Share the **student link** with your class, then start once everyone's in.")
         st.code(f"{_base_url()}/?role=student", language=None)
-        names = list(state["roster"].values())
-        st.write(f"**{len(names)} student(s) joined**")
-        if names:
-            st.write(", ".join(names))
+        roster_items = list(state["roster"].values())
+        st.write(f"**{len(roster_items)} student(s) joined**")
+        if roster_items:
+            st.write(", ".join(f"{r['name']} ({r['sid']})" for r in roster_items))
         else:
             st.caption("No one yet — waiting...")
 
@@ -370,7 +404,7 @@ def render_host():
                 else:
                     st.warning("Fill in the question text and all 4 options first.")
 
-        if st.button("Start quiz", disabled=len(names) == 0 or len(state["questions"]) == 0, type="primary"):
+        if st.button("Start quiz", disabled=len(roster_items) == 0 or len(state["questions"]) == 0, type="primary"):
             state["status"] = "active"
             state["current_q"] = 0
             state["question_started_at"] = time.time()
@@ -380,18 +414,40 @@ def render_host():
             st.rerun()
 
     elif state["status"] == "active":
-        q = state["questions"][state["current_q"]]
+        q_idx = state["current_q"]
+        q = state["questions"][q_idx]
         elapsed = time.time() - state["question_started_at"]
         remaining = max(0, q["time"] - elapsed)
-        st.subheader(f"Question {state['current_q']+1} of {len(state['questions'])}")
+        st.subheader(f"Question {q_idx+1} of {len(state['questions'])}")
         st.progress(min(1.0, remaining / q["time"]))
         st.markdown(f"### ⏱ {int(remaining)+1}s")
         st.markdown(f'<div class="qtext">{q["q"]}</div>', unsafe_allow_html=True)
         for i, opt in enumerate(q["options"]):
             st.write(f"{chr(65+i)}. {opt}")
-        answered = len(state["answers"].get(state["current_q"], {}))
-        st.caption(f"{answered} of {len(state['roster'])} students have answered")
+
+        qanswers = state["answers"].get(q_idx, {})
+        st.caption(f"{len(qanswers)} of {len(state['roster'])} students have answered")
+        with st.expander("Live responses", expanded=True):
+            # answered students first (fastest at top), then everyone still waiting
+            answered_rows = sorted(
+                [(pid, a["elapsed"]) for pid, a in qanswers.items()],
+                key=lambda x: x[1],
+            )
+            for pid, e in answered_rows:
+                info = state["roster"].get(pid, {"name": "?", "sid": "?"})
+                st.write(f"✅ {info['name']} ({info['sid']}) — answered in {e:.1f}s")
+            waiting_pids = [pid for pid in state["roster"] if pid not in qanswers]
+            for pid in waiting_pids:
+                info = state["roster"].get(pid, {"name": "?", "sid": "?"})
+                st.write(f"⏳ {info['name']} ({info['sid']}) — still answering...")
+
         if remaining <= 0:
+            # anyone who never answered counts as a miss, then rank + score the round
+            for pid in state["roster"]:
+                if pid not in qanswers:
+                    qanswers[pid] = {"choice": -1, "correct": False, "elapsed": q["time"]}
+            state["answers"][q_idx] = qanswers
+            rank_and_score_round(state, q_idx, q["time"])
             state["status"] = "reveal"
             state["reveal_started_at"] = time.time()
             st.rerun()
@@ -406,7 +462,7 @@ def render_host():
         st.write("---")
         st.write("**Leaderboard so far**")
         for i, row in enumerate(leaderboard(state)[:8]):
-            st.markdown(f'<div class="board-row"><span class="rank">#{i+1}</span><span>{row["name"]}</span><span class="score">{row["score"]}</span></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="board-row"><span class="rank">#{i+1}</span><span>{row["name"]} ({row["sid"]})</span><span class="score">{row["score"]}</span></div>', unsafe_allow_html=True)
         if time.time() - state["reveal_started_at"] >= REVEAL_SECONDS:
             nxt = state["current_q"] + 1
             if nxt >= len(state["questions"]):
@@ -421,7 +477,7 @@ def render_host():
         st.title("🏁 Quiz complete")
         st.write(f"{len(state['questions'])} questions · {len(state['roster'])} students")
         for i, row in enumerate(leaderboard(state)):
-            st.markdown(f'<div class="board-row"><span class="rank">#{i+1}</span><span>{row["name"]}</span><span class="score">{row["score"]}</span></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="board-row"><span class="rank">#{i+1}</span><span>{row["name"]} ({row["sid"]})</span><span class="score">{row["score"]}</span></div>', unsafe_allow_html=True)
         if st.button("Start a new session"):
             reset_quiz(state)
             st.rerun()
@@ -435,10 +491,6 @@ def render_student():
         st.session_state.pid = str(uuid.uuid4())
     if "joined" not in st.session_state:
         st.session_state.joined = False
-    if "answered_q" not in st.session_state:
-        st.session_state.answered_q = -1
-    if "last_choice" not in st.session_state:
-        st.session_state.last_choice = None
 
     pid = st.session_state.pid
 
@@ -446,17 +498,19 @@ def render_student():
         st.markdown('<div class="eyebrow">BIOPHARMACEUTICS LIVE QUIZ</div>', unsafe_allow_html=True)
         st.title("Join the quiz")
         name = st.text_input("Your name", max_chars=24)
+        sid = st.text_input("Your student ID", max_chars=24)
         if st.button("Join quiz", type="primary"):
-            if name.strip():
-                state["roster"][pid] = name.strip()
+            if name.strip() and sid.strip():
+                state["roster"][pid] = {"name": name.strip(), "sid": sid.strip()}
                 st.session_state.joined = True
                 st.rerun()
             else:
-                st.warning("Enter your name first.")
+                st.warning("Enter both your name and student ID — names can repeat, so the ID keeps your score yours.")
         return
 
     st_autorefresh(interval=700, key="student_autorefresh")
-    name = state["roster"].get(pid, "you")
+    my_info = state["roster"].get(pid, {"name": "you", "sid": ""})
+    name = my_info["name"]
 
     if state["status"] == "lobby":
         st.title(f"Hi {name} 👋")
@@ -465,11 +519,11 @@ def render_student():
 
     if state["status"] == "finished":
         board = leaderboard(state)
-        my_rank = next((i+1 for i, r in enumerate(board) if r["name"] == name), None)
-        my_score = next((r["score"] for r in board if r["name"] == name), 0)
+        my_rank = next((i + 1 for i, r in enumerate(board) if r["pid"] == pid), None)
+        my_score = next((r["score"] for r in board if r["pid"] == pid), 0)
         st.title(f"You finished #{my_rank or '-'} with {my_score} points")
         for i, row in enumerate(board):
-            st.markdown(f'<div class="board-row"><span class="rank">#{i+1}</span><span>{row["name"]}</span><span class="score">{row["score"]}</span></div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="board-row"><span class="rank">#{i+1}</span><span>{row["name"]} ({row["sid"]})</span><span class="score">{row["score"]}</span></div>', unsafe_allow_html=True)
         return
 
     q_idx = state["current_q"]
@@ -480,6 +534,10 @@ def render_student():
         remaining = max(0, q["time"] - elapsed)
         already_answered = state["answers"].get(q_idx, {}).get(pid) is not None
 
+        correct_so_far, attempted_so_far = my_progress(state, pid, q_idx - 1)
+        if attempted_so_far > 0:
+            st.caption(f"✅ {correct_so_far} of {attempted_so_far} correct so far")
+
         st.subheader(f"Question {q_idx+1} of {len(state['questions'])}")
         st.progress(min(1.0, remaining / q["time"]))
         st.markdown(f"### ⏱ {int(remaining)+1}s")
@@ -488,27 +546,25 @@ def render_student():
         if already_answered:
             st.info("Answer locked — waiting for the round to end.")
         elif remaining <= 0:
-            # timed out without answering — record as a zero-score miss
-            state["answers"].setdefault(q_idx, {})[pid] = {"choice": -1, "correct": False, "elapsed": q["time"], "score": 0}
-            st.session_state.answered_q = q_idx
-            st.session_state.last_choice = -1
-            st.rerun()
+            st.info("Time's up — waiting for the round to end.")
         else:
             cols = st.columns(2)
             for i, opt in enumerate(q["options"]):
                 if cols[i % 2].button(f"{chr(65+i)}. {opt}", key=f"opt_{q_idx}_{i}", use_container_width=True):
                     e = min(q["time"], time.time() - state["question_started_at"])
                     correct = (i == q["correct_index"])
-                    score = compute_score(correct, e, q["time"])
-                    state["answers"].setdefault(q_idx, {})[pid] = {"choice": i, "correct": correct, "elapsed": e, "score": score}
-                    st.session_state.answered_q = q_idx
-                    st.session_state.last_choice = i
+                    # Score is intentionally NOT set here — the host ranks every
+                    # correct answer by speed once the timer ends, so ties and
+                    # relative speed are only knowable after everyone's in.
+                    state["answers"].setdefault(q_idx, {})[pid] = {"choice": i, "correct": correct, "elapsed": e}
                     st.rerun()
 
     elif state["status"] == "reveal":
         my_answer = state["answers"].get(q_idx, {}).get(pid)
         correct = my_answer["correct"] if my_answer else False
-        score = my_answer["score"] if my_answer else 0
+        score = my_answer.get("score", 0) if my_answer else 0
+        correct_so_far, attempted_so_far = my_progress(state, pid, q_idx)
+        st.caption(f"✅ {correct_so_far} of {attempted_so_far} correct so far")
         st.title("Correct! ✅" if correct else "Not quite ❌")
         st.write(f"You scored **{score}** points this round")
         for i, opt in enumerate(q["options"]):

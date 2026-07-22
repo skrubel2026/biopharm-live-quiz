@@ -179,6 +179,29 @@ def rows_to_csv_bytes(rows):
     return buf.getvalue().encode("utf-8")
 
 
+HOST_PASSWORD = "biopharm2026"  # <-- change this any time: edit this line on GitHub, commit, and it takes effect on redeploy
+
+
+def require_host_password(state):
+    """Gate everything behind this. Returns True once the correct password
+    has been entered in THIS browser tab/session — a different device or
+    tab (e.g. a student who stumbles onto the host link) always has to
+    enter it fresh, regardless of what's happening in the live quiz."""
+    if st.session_state.get("host_authed"):
+        return True
+    st.markdown('<div class="eyebrow">HOST · BIOPHARMACEUTICS LIVE QUIZ</div>', unsafe_allow_html=True)
+    st.title("🔒 Host access")
+    st.write("This screen is for instructors only. Enter the host password to continue.")
+    pw = st.text_input("Password", type="password", key="host_pw_input")
+    if st.button("Unlock", type="primary"):
+        if pw == HOST_PASSWORD:
+            st.session_state.host_authed = True
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+    return False
+
+
 def reset_quiz(state):
     state["status"] = "lobby"
     state["current_q"] = -1
@@ -357,6 +380,28 @@ st.markdown("""
   .board-row { display:flex; justify-content:space-between; padding:10px 14px; border-bottom:1px solid #D6E2DC; }
   .rank { font-family:monospace; font-weight:700; color:#A66E1E; }
   .score { font-family:monospace; font-weight:700; color:#1F7A6C; }
+
+  @keyframes slideFadeIn {
+    from { opacity: 0; transform: translateY(18px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  @keyframes popIn {
+    0%   { opacity: 0; transform: scale(0.85); }
+    70%  { opacity: 1; transform: scale(1.03); }
+    100% { opacity: 1; transform: scale(1); }
+  }
+  @keyframes pulseWarn {
+    0%, 100% { color: #C0392B; }
+    50%      { color: #7a231b; }
+  }
+  .qtext-anim {
+    font-size:22px; font-weight:600; text-align:center; margin:18px 0;
+    animation: slideFadeIn 0.55s ease-out;
+  }
+  .reveal-anim { animation: popIn 0.5s ease-out; }
+  .board-row-anim { animation: slideFadeIn 0.4s ease-out; }
+  .timer-normal { font-family:monospace; }
+  .timer-urgent { font-family:monospace; animation: pulseWarn 0.8s infinite; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -368,6 +413,8 @@ role = st.query_params.get("role", "host")
 # HOST VIEW
 # ============================================================
 def render_host():
+    if not require_host_password(state):
+        return
     st_autorefresh(interval=1000, key="host_autorefresh")
     st.markdown('<div class="eyebrow">HOST · BIOPHARMACEUTICS LIVE QUIZ</div>', unsafe_allow_html=True)
 
@@ -470,12 +517,22 @@ def render_host():
         q = state["questions"][q_idx]
         elapsed = time.time() - state["question_started_at"]
         remaining = max(0, q["time"] - elapsed)
+
+        if "host_last_q" not in st.session_state:
+            st.session_state.host_last_q = -1
+
         st.subheader(f"Question {q_idx+1} of {len(state['questions'])}")
         st.progress(min(1.0, remaining / q["time"]))
-        st.markdown(f"### ⏱ {int(remaining)+1}s")
-        st.markdown(f'<div class="qtext">{q["q"]}</div>', unsafe_allow_html=True)
-        for i, opt in enumerate(q["options"]):
-            st.write(f"{chr(65+i)}. {opt}")
+        timer_cls = "timer-urgent" if remaining <= 5 else "timer-normal"
+        st.markdown(f'<div class="{timer_cls}"><h3>⏱ {int(remaining)+1}s</h3></div>', unsafe_allow_html=True)
+
+        qtext_slot = st.empty()
+        if st.session_state.host_last_q != q_idx:
+            with qtext_slot.container():
+                st.markdown(f'<div class="qtext-anim">{q["q"]}</div>', unsafe_allow_html=True)
+                for i, opt in enumerate(q["options"]):
+                    st.write(f"{chr(65+i)}. {opt}")
+            st.session_state.host_last_q = q_idx
 
         qanswers = state["answers"].get(q_idx, {})
         st.caption(f"{len(qanswers)} of {len(state['roster'])} students have answered")
@@ -505,16 +562,26 @@ def render_host():
             st.rerun()
 
     elif state["status"] == "reveal":
-        q = state["questions"][state["current_q"]]
-        st.subheader(f"Question {state['current_q']+1} — Answer")
-        st.markdown(f'<div class="qtext">{q["q"]}</div>', unsafe_allow_html=True)
-        for i, opt in enumerate(q["options"]):
-            marker = "✅ " if i == q["correct_index"] else "▫️ "
-            st.write(f"{marker}{chr(65+i)}. {opt}")
-        st.write("---")
-        st.write("**Leaderboard so far**")
-        for i, row in enumerate(leaderboard(state)[:8]):
-            st.markdown(f'<div class="board-row"><span class="rank">#{i+1}</span><span>{row["name"]} ({row["sid"]})</span><span class="score">{row["score"]}</span></div>', unsafe_allow_html=True)
+        q_idx = state["current_q"]
+        q = state["questions"][q_idx]
+
+        if "host_last_reveal_q" not in st.session_state:
+            st.session_state.host_last_reveal_q = -1
+
+        reveal_slot = st.empty()
+        if st.session_state.host_last_reveal_q != q_idx:
+            with reveal_slot.container():
+                st.subheader(f"Question {q_idx+1} — Answer")
+                st.markdown(f'<div class="qtext-anim">{q["q"]}</div>', unsafe_allow_html=True)
+                for i, opt in enumerate(q["options"]):
+                    marker = "✅ " if i == q["correct_index"] else "▫️ "
+                    st.write(f"{marker}{chr(65+i)}. {opt}")
+                st.write("---")
+                st.write("**Leaderboard so far**")
+                for i, row in enumerate(leaderboard(state)[:8]):
+                    st.markdown(f'<div class="board-row board-row-anim"><span class="rank">#{i+1}</span><span>{row["name"]} ({row["sid"]})</span><span class="score">{row["score"]}</span></div>', unsafe_allow_html=True)
+            st.session_state.host_last_reveal_q = q_idx
+
         if time.time() - state["reveal_started_at"] >= REVEAL_SECONDS:
             nxt = state["current_q"] + 1
             if nxt >= len(state["questions"]):
@@ -635,14 +702,23 @@ def render_student():
         remaining = max(0, q["time"] - elapsed)
         already_answered = state["answers"].get(q_idx, {}).get(pid) is not None
 
+        if "student_last_q" not in st.session_state:
+            st.session_state.student_last_q = -1
+
         correct_so_far, attempted_so_far = my_progress(state, pid, q_idx - 1)
         if attempted_so_far > 0:
             st.caption(f"✅ {correct_so_far} of {attempted_so_far} correct so far")
 
         st.subheader(f"Question {q_idx+1} of {len(state['questions'])}")
         st.progress(min(1.0, remaining / q["time"]))
-        st.markdown(f"### ⏱ {int(remaining)+1}s")
-        st.markdown(f'<div class="qtext">{q["q"]}</div>', unsafe_allow_html=True)
+        timer_cls = "timer-urgent" if remaining <= 5 else "timer-normal"
+        st.markdown(f'<div class="{timer_cls}"><h3>⏱ {int(remaining)+1}s</h3></div>', unsafe_allow_html=True)
+
+        qtext_slot = st.empty()
+        if st.session_state.student_last_q != q_idx:
+            with qtext_slot.container():
+                st.markdown(f'<div class="qtext-anim">{q["q"]}</div>', unsafe_allow_html=True)
+            st.session_state.student_last_q = q_idx
 
         if already_answered:
             st.info("Answer locked — waiting for the round to end.")
@@ -661,16 +737,26 @@ def render_student():
                     st.rerun()
 
     elif state["status"] == "reveal":
-        my_answer = state["answers"].get(q_idx, {}).get(pid)
-        correct = my_answer["correct"] if my_answer else False
-        score = my_answer.get("score", 0) if my_answer else 0
-        correct_so_far, attempted_so_far = my_progress(state, pid, q_idx)
-        st.caption(f"✅ {correct_so_far} of {attempted_so_far} correct so far")
-        st.title("Correct! ✅" if correct else "Not quite ❌")
-        st.write(f"You scored **{score}** points this round")
-        for i, opt in enumerate(q["options"]):
-            marker = "✅ " if i == q["correct_index"] else "▫️ "
-            st.write(f"{marker}{chr(65+i)}. {opt}")
+        if "student_last_reveal_q" not in st.session_state:
+            st.session_state.student_last_reveal_q = -1
+
+        reveal_slot = st.empty()
+        if st.session_state.student_last_reveal_q != q_idx:
+            my_answer = state["answers"].get(q_idx, {}).get(pid)
+            correct = my_answer["correct"] if my_answer else False
+            score = my_answer.get("score", 0) if my_answer else 0
+            correct_so_far, attempted_so_far = my_progress(state, pid, q_idx)
+            with reveal_slot.container():
+                st.caption(f"✅ {correct_so_far} of {attempted_so_far} correct so far")
+                st.markdown(
+                    f'<div class="reveal-anim"><h1>{"Correct! ✅" if correct else "Not quite ❌"}</h1></div>',
+                    unsafe_allow_html=True,
+                )
+                st.write(f"You scored **{score}** points this round")
+                for i, opt in enumerate(q["options"]):
+                    marker = "✅ " if i == q["correct_index"] else "▫️ "
+                    st.write(f"{marker}{chr(65+i)}. {opt}")
+            st.session_state.student_last_reveal_q = q_idx
 
 
 def _base_url():

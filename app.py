@@ -34,6 +34,13 @@ import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 from docx import Document
 
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+    GSPREAD_AVAILABLE = True
+except Exception:
+    GSPREAD_AVAILABLE = False
+
 # ============================================================
 # QUESTION BANK — edit freely
 # ============================================================
@@ -61,18 +68,106 @@ QUESTIONS = [
 ]
 REVEAL_SECONDS = 6  # how long the answer reveal / round leaderboard shows before auto-advancing
 
+# ============================================================
+# GOOGLE SHEETS — question storage that survives app restarts
+# ============================================================
+# 1. Paste your Google Sheet's URL below (the sheet needs one tab named
+#    exactly "Questions" with this header row in row 1:
+#    Question | OptionA | OptionB | OptionC | OptionD | Correct | Time
+# 2. Share that sheet (Editor access) with your service account's email.
+# 3. Put the service account's JSON key into Streamlit Cloud -> your app ->
+#    Settings -> Secrets, under the key name  gcp_service_account
+#    (see the setup guide for the exact format).
+SHEET_URL = "PASTE_YOUR_GOOGLE_SHEET_URL_HERE"  # <-- change this
+WORKSHEET_NAME = "Questions"
+
+
+def _get_gsheet_client():
+    if not GSPREAD_AVAILABLE:
+        return None, "The gspread library isn't installed (check requirements.txt)."
+    try:
+        creds_dict = dict(st.secrets["gcp_service_account"])
+    except Exception:
+        return None, "No Google service account found in Streamlit Secrets (gcp_service_account)."
+    try:
+        scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        return gspread.authorize(creds), None
+    except Exception as e:
+        return None, f"Couldn't authenticate with Google: {e}"
+
+
+def load_questions_from_sheet():
+    """Returns (questions_or_None, error_message_or_None)."""
+    if not SHEET_URL or "PASTE_YOUR" in SHEET_URL:
+        return None, "No Google Sheet URL set yet (SHEET_URL in app.py)."
+    client, err = _get_gsheet_client()
+    if client is None:
+        return None, err
+    try:
+        sh = client.open_by_url(SHEET_URL)
+        ws = sh.worksheet(WORKSHEET_NAME)
+        records = ws.get_all_records()
+    except Exception as e:
+        return None, f"Couldn't read the Google Sheet: {e}"
+
+    questions = []
+    for r in records:
+        try:
+            q_text = str(r.get("Question", "")).strip()
+            correct_letter = str(r.get("Correct", "")).strip().upper()
+            opts = [str(r.get("OptionA", "")).strip(), str(r.get("OptionB", "")).strip(),
+                    str(r.get("OptionC", "")).strip(), str(r.get("OptionD", "")).strip()]
+            if not q_text or correct_letter not in ("A", "B", "C", "D") or any(not o for o in opts):
+                continue  # skip blank/incomplete rows rather than treating them as a question
+            questions.append({
+                "q": q_text,
+                "options": opts,
+                "correct_index": "ABCD".index(correct_letter),
+                "time": int(r["Time"]) if str(r.get("Time", "")).strip() else 30,
+            })
+        except Exception:
+            continue  # skip any malformed row rather than failing the whole load
+    if not questions:
+        return None, "Connected to the sheet, but no valid question rows were found."
+    return questions, None
+
+
+def save_questions_to_sheet(questions):
+    """Returns (success_bool, error_message_or_None)."""
+    if not SHEET_URL or "PASTE_YOUR" in SHEET_URL:
+        return False, "No Google Sheet URL set yet (SHEET_URL in app.py)."
+    client, err = _get_gsheet_client()
+    if client is None:
+        return False, err
+    try:
+        sh = client.open_by_url(SHEET_URL)
+        ws = sh.worksheet(WORKSHEET_NAME)
+        header = ["Question", "OptionA", "OptionB", "OptionC", "OptionD", "Correct", "Time"]
+        rows = [header]
+        for q in questions:
+            rows.append([q["q"], q["options"][0], q["options"][1], q["options"][2], q["options"][3], "ABCD"[q["correct_index"]], q["time"]])
+        ws.clear()
+        ws.update(values=rows, range_name="A1")
+        return True, None
+    except Exception as e:
+        return False, f"Couldn't save to the Google Sheet: {e}"
+
 
 # ============================================================
 # SHARED STATE (one instance shared by every visitor to this app)
 # ============================================================
 @st.cache_resource
 def get_state():
+    sheet_questions, sheet_error = load_questions_from_sheet()
     return {
         "status": "lobby",          # lobby | active | reveal | finished
         "current_q": -1,
         "question_started_at": 0.0,
         "reveal_started_at": 0.0,
-        "questions": [dict(q) for q in QUESTIONS],  # editable copy — host can add/remove from the UI
+        "questions": sheet_questions if sheet_questions else [dict(q) for q in QUESTIONS],
+        "using_sheet": sheet_questions is not None,
+        "sheet_error": sheet_error,
         "roster": {},                # pid -> {"name": str, "sid": str}
         "answers": {},                # q_index -> {pid: {"choice", "correct", "elapsed", "score"}}
     }
@@ -430,13 +525,27 @@ def render_host():
             st.caption("No one yet — waiting...")
 
         with st.expander(f"📋 Manage questions ({len(state['questions'])} currently)"):
-            st.caption("Add, edit, or remove questions before starting. These changes apply to this running app for everyone, until the app restarts.")
+            if state.get("using_sheet"):
+                st.caption("✅ Questions are stored in your Google Sheet — changes here save there too, so they survive app restarts.")
+                if st.button("🔄 Reload from Google Sheet"):
+                    fresh, ferr = load_questions_from_sheet()
+                    if fresh:
+                        state["questions"] = fresh
+                        st.success(f"Reloaded {len(fresh)} question(s) from the sheet.")
+                    else:
+                        st.warning(f"Couldn't reload: {ferr}")
+                    st.rerun()
+            else:
+                st.warning(f"⚠️ Not connected to Google Sheets ({state.get('sheet_error', 'unknown reason')}). Using built-in defaults for now — changes here will be lost if the app restarts. See the setup guide.")
             for i, q in enumerate(state["questions"]):
                 cols = st.columns([7, 1])
                 correct_opt = q["options"][q["correct_index"]]
                 cols[0].markdown(f"**Q{i+1}.** {q['q']}  \n*Correct: {correct_opt} · {q['time']}s*")
                 if cols[1].button("Remove", key=f"delq_{i}"):
                     state["questions"].pop(i)
+                    ok, err = save_questions_to_sheet(state["questions"])
+                    if not ok and state.get("using_sheet"):
+                        st.warning(f"Removed here, but couldn't save to the sheet: {err}")
                     st.rerun()
 
             st.write("---")
@@ -475,6 +584,9 @@ def render_host():
                             state["questions"] = parsed
                         else:
                             state["questions"].extend(parsed)
+                        ok, err = save_questions_to_sheet(state["questions"])
+                        if not ok and state.get("using_sheet"):
+                            st.warning(f"Imported here, but couldn't save to the sheet: {err}")
                         st.rerun()
                 else:
                     st.error("No valid questions found in this file. Check the format matches the example above.")
@@ -496,6 +608,9 @@ def render_host():
                         "correct_index": new_correct,
                         "time": int(new_time),
                     })
+                    ok, err = save_questions_to_sheet(state["questions"])
+                    if not ok and state.get("using_sheet"):
+                        st.warning(f"Added here, but couldn't save to the sheet: {err}")
                     for k in ["new_q_text", "new_opt_0", "new_opt_1", "new_opt_2", "new_opt_3"]:
                         if k in st.session_state:
                             del st.session_state[k]

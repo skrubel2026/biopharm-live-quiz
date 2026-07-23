@@ -78,7 +78,7 @@ REVEAL_SECONDS = 6  # how long the answer reveal / round leaderboard shows befor
 # 3. Put the service account's JSON key into Streamlit Cloud -> your app ->
 #    Settings -> Secrets, under the key name  gcp_service_account
 #    (see the setup guide for the exact format).
-SHEET_URL = "https://docs.google.com/spreadsheets/d/1sXwJWDIUSc753JwnMURkOSEabU45WlbdV3_71UgipHY/edit?gid=0#gid=0"  # <-- change this
+SHEET_URL = "PASTE_YOUR_GOOGLE_SHEET_URL_HERE"  # <-- change this
 WORKSHEET_NAME = "Questions"
 
 
@@ -297,6 +297,19 @@ def require_host_password(state):
     return False
 
 
+def _note_sheet_result(state, ok, err):
+    """Keeps state['using_sheet'] accurate based on the most recent attempt,
+    rather than only what happened once at app startup."""
+    if ok:
+        state["using_sheet"] = True
+        state["sheet_error"] = None
+    else:
+        state["sheet_error"] = err
+        # Only flip to "not connected" if we don't already have sheet-backed
+        # questions loaded — a single transient save error shouldn't undo
+        # a working connection.
+
+
 def reset_quiz(state):
     state["status"] = "lobby"
     state["current_q"] = -1
@@ -489,10 +502,6 @@ st.markdown("""
     0%, 100% { color: #C0392B; }
     50%      { color: #7a231b; }
   }
-  .qtext-anim {
-    font-size:22px; font-weight:600; text-align:center; margin:18px 0;
-    animation: slideFadeIn 0.55s ease-out;
-  }
   .reveal-anim { animation: popIn 0.5s ease-out; }
   .board-row-anim { animation: slideFadeIn 0.4s ease-out; }
   .timer-normal { font-family:monospace; }
@@ -527,16 +536,18 @@ def render_host():
         with st.expander(f"📋 Manage questions ({len(state['questions'])} currently)"):
             if state.get("using_sheet"):
                 st.caption("✅ Questions are stored in your Google Sheet — changes here save there too, so they survive app restarts.")
-                if st.button("🔄 Reload from Google Sheet"):
-                    fresh, ferr = load_questions_from_sheet()
-                    if fresh:
-                        state["questions"] = fresh
-                        st.success(f"Reloaded {len(fresh)} question(s) from the sheet.")
-                    else:
-                        st.warning(f"Couldn't reload: {ferr}")
-                    st.rerun()
             else:
-                st.warning(f"⚠️ Not connected to Google Sheets ({state.get('sheet_error', 'unknown reason')}). Using built-in defaults for now — changes here will be lost if the app restarts. See the setup guide.")
+                st.warning(f"⚠️ Not currently confirmed as connected to Google Sheets ({state.get('sheet_error', 'unknown reason')}). Using in-memory questions for now — try 'Reload from Google Sheet' below, or check the setup guide.")
+            if st.button("🔄 Reload from Google Sheet"):
+                fresh, ferr = load_questions_from_sheet()
+                if fresh:
+                    state["questions"] = fresh
+                    _note_sheet_result(state, True, None)
+                    st.success(f"Reloaded {len(fresh)} question(s) from the sheet — connection confirmed.")
+                else:
+                    _note_sheet_result(state, False, ferr)
+                    st.warning(f"Couldn't reload: {ferr}")
+                st.rerun()
             for i, q in enumerate(state["questions"]):
                 cols = st.columns([7, 1])
                 correct_opt = q["options"][q["correct_index"]]
@@ -544,7 +555,8 @@ def render_host():
                 if cols[1].button("Remove", key=f"delq_{i}"):
                     state["questions"].pop(i)
                     ok, err = save_questions_to_sheet(state["questions"])
-                    if not ok and state.get("using_sheet"):
+                    _note_sheet_result(state, ok, err)
+                    if not ok:
                         st.warning(f"Removed here, but couldn't save to the sheet: {err}")
                     st.rerun()
 
@@ -585,7 +597,8 @@ def render_host():
                         else:
                             state["questions"].extend(parsed)
                         ok, err = save_questions_to_sheet(state["questions"])
-                        if not ok and state.get("using_sheet"):
+                        _note_sheet_result(state, ok, err)
+                        if not ok:
                             st.warning(f"Imported here, but couldn't save to the sheet: {err}")
                         st.rerun()
                 else:
@@ -609,7 +622,8 @@ def render_host():
                         "time": int(new_time),
                     })
                     ok, err = save_questions_to_sheet(state["questions"])
-                    if not ok and state.get("using_sheet"):
+                    _note_sheet_result(state, ok, err)
+                    if not ok:
                         st.warning(f"Added here, but couldn't save to the sheet: {err}")
                     for k in ["new_q_text", "new_opt_0", "new_opt_1", "new_opt_2", "new_opt_3"]:
                         if k in st.session_state:
@@ -633,21 +647,14 @@ def render_host():
         elapsed = time.time() - state["question_started_at"]
         remaining = max(0, q["time"] - elapsed)
 
-        if "host_last_q" not in st.session_state:
-            st.session_state.host_last_q = -1
-
         st.subheader(f"Question {q_idx+1} of {len(state['questions'])}")
         st.progress(min(1.0, remaining / q["time"]))
         timer_cls = "timer-urgent" if remaining <= 5 else "timer-normal"
         st.markdown(f'<div class="{timer_cls}"><h3>⏱ {int(remaining)+1}s</h3></div>', unsafe_allow_html=True)
 
-        qtext_slot = st.empty()
-        if st.session_state.host_last_q != q_idx:
-            with qtext_slot.container():
-                st.markdown(f'<div class="qtext-anim">{q["q"]}</div>', unsafe_allow_html=True)
-                for i, opt in enumerate(q["options"]):
-                    st.write(f"{chr(65+i)}. {opt}")
-            st.session_state.host_last_q = q_idx
+        st.markdown(f'<div class="qtext">{q["q"]}</div>', unsafe_allow_html=True)
+        for i, opt in enumerate(q["options"]):
+            st.write(f"{chr(65+i)}. {opt}")
 
         qanswers = state["answers"].get(q_idx, {})
         st.caption(f"{len(qanswers)} of {len(state['roster'])} students have answered")
@@ -687,7 +694,7 @@ def render_host():
         if st.session_state.host_last_reveal_q != q_idx:
             with reveal_slot.container():
                 st.subheader(f"Question {q_idx+1} — Answer")
-                st.markdown(f'<div class="qtext-anim">{q["q"]}</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="qtext">{q["q"]}</div>', unsafe_allow_html=True)
                 for i, opt in enumerate(q["options"]):
                     marker = "✅ " if i == q["correct_index"] else "▫️ "
                     st.write(f"{marker}{chr(65+i)}. {opt}")
@@ -817,9 +824,6 @@ def render_student():
         remaining = max(0, q["time"] - elapsed)
         already_answered = state["answers"].get(q_idx, {}).get(pid) is not None
 
-        if "student_last_q" not in st.session_state:
-            st.session_state.student_last_q = -1
-
         correct_so_far, attempted_so_far = my_progress(state, pid, q_idx - 1)
         if attempted_so_far > 0:
             st.caption(f"✅ {correct_so_far} of {attempted_so_far} correct so far")
@@ -829,11 +833,7 @@ def render_student():
         timer_cls = "timer-urgent" if remaining <= 5 else "timer-normal"
         st.markdown(f'<div class="{timer_cls}"><h3>⏱ {int(remaining)+1}s</h3></div>', unsafe_allow_html=True)
 
-        qtext_slot = st.empty()
-        if st.session_state.student_last_q != q_idx:
-            with qtext_slot.container():
-                st.markdown(f'<div class="qtext-anim">{q["q"]}</div>', unsafe_allow_html=True)
-            st.session_state.student_last_q = q_idx
+        st.markdown(f'<div class="qtext">{q["q"]}</div>', unsafe_allow_html=True)
 
         if already_answered:
             st.info("Answer locked — waiting for the round to end.")

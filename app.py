@@ -78,7 +78,7 @@ REVEAL_SECONDS = 6  # how long the answer reveal / round leaderboard shows befor
 # 3. Put the service account's JSON key into Streamlit Cloud -> your app ->
 #    Settings -> Secrets, under the key name  gcp_service_account
 #    (see the setup guide for the exact format).
-SHEET_URL = "PASTE_YOUR_GOOGLE_SHEET_URL_HERE"  # <-- change this
+SHEET_URL = "https://docs.google.com/spreadsheets/d/1sXwJWDIUSc753JwnMURkOSEabU45WlbdV3_71UgipHY/edit?gid=0#gid=0"  # <-- change this
 WORKSHEET_NAME = "Questions"
 
 
